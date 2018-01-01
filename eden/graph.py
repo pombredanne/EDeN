@@ -3,7 +3,6 @@
 
 import joblib
 import networkx as nx
-import multiprocessing
 import math
 import numpy as np
 from sklearn import metrics
@@ -12,8 +11,6 @@ from scipy import stats
 from scipy.sparse import csr_matrix
 from scipy.sparse import vstack
 from collections import defaultdict, deque
-from eden import apply_async
-from eden import chunks
 from eden import fast_hash, fast_hash_vec
 from eden import fast_hash_2, fast_hash_3, fast_hash_4
 from eden import AbstractVectorizer
@@ -30,26 +27,32 @@ def auto_label(graphs, n_clusters=16, **opts):
     """
     data_list = Vectorizer(**opts).vertex_transform(graphs)
     data_matrix = vstack(data_list)
-    preds = MiniBatchKMeans(n_clusters=n_clusters).fit_predict(data_matrix)
+    clu = MiniBatchKMeans(n_clusters=n_clusters, n_init=10)
+    clu.fit(data_matrix)
+    preds = clu.predict(data_matrix)
+    vecs = clu.transform(data_matrix)
     sizes = [m.shape[0] for m in data_list]
     label_list = []
+    vecs_list = []
     pointer = 0
     for size in sizes:
-        labels = preds[pointer: pointer + size]
-        label_list.append(labels)
+        label_list.append(preds[pointer: pointer + size])
+        vecs_list.append(vecs[pointer: pointer + size])
         pointer += size
-    return label_list
+    return label_list, vecs_list
 
 
 def auto_relabel(graphs, n_clusters=16, **opts):
     """Label nodes with cluster id."""
     graphs, graphs_ = tee(graphs)
-    label_list = auto_label(graphs_, n_clusters=n_clusters, **opts)
+    label_list, vecs_list = auto_label(graphs_, n_clusters=n_clusters, **opts)
     relabeled_graphs = []
-    for labels, graph in zip(label_list, graphs):
-        for label, u in zip(labels, graph.nodes()):
+    for labels, vecs, orig_graph in zip(label_list, vecs_list, graphs):
+        graph = nx.Graph(orig_graph)
+        for label, vec, u in zip(labels, vecs, graph.nodes()):
             graph.node[u]['label'] = label
-        relabeled_graphs.append(graph.copy())
+            graph.node[u]['vec'] = list(vec)
+        relabeled_graphs.append(graph)
     return relabeled_graphs
 
 
@@ -99,8 +102,6 @@ class Vectorizer(AbstractVectorizer):
                  inner_normalization=True,
                  positional=False,
                  discrete=True,
-                 block_size=100,
-                 n_jobs=-1,
                  key_label='label',
                  key_weight='weight',
                  key_nesting='nesting',
@@ -194,14 +195,12 @@ class Vectorizer(AbstractVectorizer):
         self.min_d = min_d
         self.weights_dict = weights_dict
         if auto_weights:
-            self.weights_dict = {(i, i): 1 for i in range(complexity)}
+            self.weights_dict = {(i, i + 1): 1 for i in range(max(r, d))}
         self.nbits = nbits
         self.normalization = normalization
         self.inner_normalization = inner_normalization
         self.positional = positional
         self.discrete = discrete
-        self.block_size = block_size
-        self.n_jobs = n_jobs
         self.bitmask = pow(2, nbits) - 1
         self.feature_size = self.bitmask + 2
         self.key_label = key_label
@@ -236,6 +235,16 @@ class Vectorizer(AbstractVectorizer):
             self.inner_normalization = args['inner_normalization']
         if args.get('positional', None) is not None:
             self.positional = args['positional']
+
+    def get_params(self):
+        """Get parameters for teh vectorizer.
+
+        Returns
+        -------
+        params : mapping of string to any
+            Parameter names mapped to their values.
+        """
+        return self.__dict__
 
     def __repr__(self):
         """string."""
@@ -282,29 +291,6 @@ class Vectorizer(AbstractVectorizer):
         >>> vec_to_hash(v.transform([g])) == vec_to_hash (v.transform([g2]))
         True
         """
-        if self.n_jobs == 1:
-            return self._transform_serial(graphs)
-
-        if self.n_jobs == -1:
-            pool = multiprocessing.Pool(multiprocessing.cpu_count())
-        else:
-            pool = multiprocessing.Pool(self.n_jobs)
-
-        results = [apply_async(
-            pool, self._transform_serial,
-            args=([subset_graphs]))
-            for subset_graphs in chunks(graphs, self.block_size)]
-        for i, p in enumerate(results):
-            pos_data_matrix = p.get()
-            if i == 0:
-                data_matrix = pos_data_matrix
-            else:
-                data_matrix = vstack([data_matrix, pos_data_matrix])
-        pool.close()
-        pool.join()
-        return data_matrix
-
-    def _transform_serial(self, graphs):
         instance_id = None
         feature_rows = []
         for instance_id, graph in enumerate(graphs):
@@ -334,26 +320,6 @@ class Vectorizer(AbstractVectorizer):
             Vector representation of each vertex in the input graphs.
 
         """
-        if self.n_jobs == 1:
-            return self._vertex_transform_serial(graphs)
-
-        if self.n_jobs == -1:
-            pool = multiprocessing.Pool(multiprocessing.cpu_count())
-        else:
-            pool = multiprocessing.Pool(self.n_jobs)
-
-        results = [apply_async(
-            pool, self._vertex_transform_serial,
-            args=([subset_graphs]))
-            for subset_graphs in chunks(graphs, self.block_size)]
-        matrix_list = []
-        for i, p in enumerate(results):
-            matrix_list += p.get()
-        pool.close()
-        pool.join()
-        return matrix_list
-
-    def _vertex_transform_serial(self, graphs):
         matrix_list = []
         for instance_id, graph in enumerate(graphs):
             self._test_goodness(graph)
@@ -452,16 +418,30 @@ class Vectorizer(AbstractVectorizer):
                 if distance in root_dist_dict:
                     node_set = root_dist_dict[distance]
                     for vertex_u in node_set:
-                        self._transform_vertex_pair(graph, vertex_v, vertex_u,
-                                                    distance,
-                                                    node_feature_list)
-            self._transform_vertex_nesting(graph, vertex_v, node_feature_list)
+                        self._transform_vertex_pair(
+                            graph,
+                            vertex_v,
+                            vertex_u,
+                            distance,
+                            node_feature_list)
+            self._transform_vertex_nesting(
+                graph,
+                vertex_v,
+                node_feature_list)
             node_feature_list = self._add_vector_labes(
-                graph, vertex_v, node_feature_list)
-            self._update_feature_list(node_feature_list, feature_list)
+                graph,
+                vertex_v,
+                node_feature_list)
+            self._update_feature_list(
+                node_feature_list,
+                feature_list)
             node_sparse_feature_list = self._add_sparse_vector_labes(
-                graph, vertex_v, node_feature_list)
-            self._update_feature_list(node_sparse_feature_list, feature_list)
+                graph,
+                vertex_v,
+                node_feature_list)
+            self._update_feature_list(
+                node_sparse_feature_list,
+                feature_list)
 
     def _add_vector_labes(self, graph, vertex_v, node_feature_list):
         # add the vector with an offset given by the feature, multiplied by val
@@ -650,12 +630,10 @@ class Vectorizer(AbstractVectorizer):
                 # position of the vertex v w.r.t. the root vertex
                 if self.positional:
                     vhlabel = fast_hash_2(
-                        graph.node[v]['hlabel'],
-                        root - v)
+                        graph.node[v]['hlabel'], root - v)
                 else:
-                    vhlabel = \
-                        fast_hash_2(graph.node[v]['hlabel'],
-                                    len(graph[v]))
+                    vhlabel = fast_hash_2(
+                        graph.node[v]['hlabel'], len(graph[v]))
                 hash_label_list.append(vhlabel)
             # sort it
             hash_label_list.sort()
@@ -750,6 +728,7 @@ class Vectorizer(AbstractVectorizer):
                  graphs,
                  estimator=None,
                  reweight=1.0,
+                 threshold=None,
                  vertex_features=False):
         """Return graphs with extra attributes: importance and features.
 
@@ -778,6 +757,10 @@ class Vectorizer(AbstractVectorizer):
             If reweight = 0.5 then update with the arithmetic mean of the
             current weight information and the abs( score )
 
+        threshold : float (default: None)
+            If not None, threshold the importance value before computing
+            the weight.
+
         vertex_features : bool (default false)
             Flag to compute the sparse vector encoding of all features that
             have that vertex as root. An attribute with key 'features' is
@@ -787,6 +770,7 @@ class Vectorizer(AbstractVectorizer):
         """
         self.estimator = estimator
         self.reweight = reweight
+        self.threshold = threshold
         self.vertex_features = vertex_features
 
         for graph in graphs:
@@ -871,6 +855,8 @@ class Vectorizer(AbstractVectorizer):
     def _annotate_importance(self, graph, data_matrix):
         predictions, margins = self._compute_predictions_and_margins(
             graph, data_matrix)
+        if self.threshold is not None:
+            margins[margins < self.threshold] = self.threshold
         # annotate graph structure with vertex importance
         vertex_id = 0
         for v, d in graph.nodes_iter(data=True):

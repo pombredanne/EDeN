@@ -2,19 +2,14 @@
 """Provides scikit interface."""
 
 import numpy as np
-from eden.graph import vectorize
 from eden.util import timeit
 import random
 from toolz.sandbox.core import unzip
 from collections import Counter
 from toolz.curried import first, second, groupby
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.linear_model import SGDClassifier
-import dask_searchcv as dcv
-from sklearn.model_selection import learning_curve
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.model_selection import ShuffleSplit
 from sklearn.metrics import classification_report
-from sklearn.model_selection import cross_val_score
 from sklearn.metrics import average_precision_score
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import roc_auc_score
@@ -22,10 +17,29 @@ from sklearn.metrics import make_scorer
 import pylab as plt
 from eden.display import plot_confusion_matrices
 from eden.display import plot_aucs
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.model_selection import cross_val_score
 import logging
 
 logger = logging.getLogger()
+
+
+@timeit
+def process_vec_info(g, n_clusters=8):
+    """process_vec_info."""
+    # extract node vec information and make np data matrix
+    data_matrix = np.array([g.node[u]['vec'] for u in g.nodes()])
+    # cluster with kmeans
+    clu = MiniBatchKMeans(n_clusters=n_clusters, n_init=10)
+    clu.fit(data_matrix)
+    preds = clu.predict(data_matrix)
+    vecs = clu.transform(data_matrix)
+    vecs = 1 / (1 + vecs)
+    # replace node information
+    graph = g.copy()
+    for u in graph.nodes():
+        graph.node[u]['label'] = str(preds[u])
+        graph.node[u]['vec'] = list(vecs[u])
+    return graph
 
 
 def paired_shuffle(iterable1, iterable2):
@@ -95,130 +109,25 @@ def balance(graphs, targets, estimator, ratio=2):
     return paired_shuffle(bal_graphs, bal_targets)
 
 
-class EdenEstimator(BaseEstimator, ClassifierMixin):
-    """Build an estimator for graphs."""
-
-    def __init__(self, r=2, d=2, discrete=True,
-                 balance=False, subsample_size=200, ratio=2):
-        """construct."""
-        self.set_params(r, d, discrete, balance, subsample_size, ratio)
-
-    def set_params(self, r=2, d=2, discrete=True,
-                   balance=False, subsample_size=200, ratio=2):
-        """setter."""
-        self.r = r
-        self.d = d
-        self.discrete = discrete
-        self.balance = balance
-        self.subsample_size = subsample_size
-        self.ratio = ratio
-        self.model = SGDClassifier(
-            average=True, class_weight='balanced', shuffle=True, n_jobs=-1)
-        return self
-
-    def transform(self, graphs):
-        """transform."""
-        x = vectorize(graphs, r=self.r, d=self.d, discrete=self.discrete)
-        return x
-
-    @timeit
-    def fit(self, graphs, targets, randomize=True):
-        """fit."""
-        if self.balance:
-            if randomize:
-                bal_graphs, bal_targets = balance(
-                    graphs, targets, None, ratio=self.ratio)
-            else:
-                samp_graphs, samp_targets = subsample(
-                    graphs, targets, subsample_size=self.subsample_size)
-                x = self.transform(samp_graphs)
-                self.model.fit(x, samp_targets)
-                bal_graphs, bal_targets = balance(
-                    graphs, targets, self, ratio=self.ratio)
-            size = len(bal_targets)
-            logger.debug('Dataset size=%d' % (size))
-            x = self.transform(bal_graphs)
-            self.model.fit(x, bal_targets)
-        else:
-            x = self.transform(graphs)
-            self.model.fit(x, targets)
-        return self
-
-    @timeit
-    def predict(self, graphs):
-        """predict."""
-        x = self.transform(graphs)
-        preds = self.model.predict(x)
-        return preds
-
-    @timeit
-    def decision_function(self, graphs):
-        """decision_function."""
-        x = self.transform(graphs)
-        preds = self.model.decision_function(x)
-        return preds
-
-    @timeit
-    def model_selection(self, graphs, targets, subsample_size=None):
-        """model_selection."""
-        return self._model_selection(
-            graphs, targets, None, subsample_size, mode='grid')
-
-    @timeit
-    def model_selection_randomized(self, graphs, targets,
-                                   n_iter=30, subsample_size=None):
-        """model_selection_randomized."""
-        return self._model_selection(
-            graphs, targets, n_iter, subsample_size, mode='randomized')
-
-    def _model_selection(self, graphs, targets, n_iter=30,
-                         subsample_size=None, mode='randomized'):
-        param_distr = {"r": list(range(1, 4)), "d": list(range(0, 4))}
-        if mode == 'randomized':
-            search = dcv.RandomizedSearchCV(
-                self, param_distr, cv=3, n_iter=n_iter)
-            logger.debug("Best parameters in %d iter:\n%s" %
-                         (n_iter, search.best_params_))
-        else:
-            search = dcv.GridSearchCV(self, param_distr, cv=3)
-            logger.debug("Best parameters:\n%s" % (search.best_params_))
-        if subsample_size:
-            graphs, targets = subsample(
-                graphs, targets, subsample_size=subsample_size)
-        search.fit(graphs, targets)
-        self = search.best_estimator_
-        return self
-
-    @timeit
-    def learning_curve(self, graphs, targets, cv=5, n_steps=10):
-        """learning_curve."""
-        x = self.transform(graphs)
-        train_sizes = np.linspace(0.1, 1.0, n_steps)
-        scoring = 'roc_auc'
-        train_sizes, train_scores, test_scores = learning_curve(
-            self.model, x, targets,
-            cv=cv, train_sizes=train_sizes,
-            scoring=scoring)
-        return train_sizes, train_scores, test_scores
-
-
-@timeit
-def process_vec_info(g, n_clusters=8, cv=3):
-    """process_vec_info."""
-    # extract node vec information and make np data matrix
-    data_matrix = np.array([g.node[u]['vec'] for u in g.nodes()])
-    # cluster with kmeans
-    clu = MiniBatchKMeans(n_clusters=n_clusters, n_init=10)
-    clu.fit(data_matrix)
-    preds = clu.predict(data_matrix)
-    vecs = clu.transform(data_matrix)
-    vecs = 1 / (1 + vecs)
-    # replace node information
-    graph = g.copy()
-    for u in graph.nodes():
-        graph.node[u]['label'] = str(preds[u])
-        graph.node[u]['vec'] = list(vecs[u])
-    return graph
+def make_train_test_sets(pos_graphs, neg_graphs,
+                         test_proportion=.3, random_state=2):
+    """make_train_test_sets."""
+    random.seed(random_state)
+    random.shuffle(pos_graphs)
+    random.shuffle(neg_graphs)
+    pos_dim = len(pos_graphs)
+    neg_dim = len(neg_graphs)
+    tr_pos_graphs = pos_graphs[:-int(pos_dim * test_proportion)]
+    te_pos_graphs = pos_graphs[-int(pos_dim * test_proportion):]
+    tr_neg_graphs = neg_graphs[:-int(neg_dim * test_proportion)]
+    te_neg_graphs = neg_graphs[-int(neg_dim * test_proportion):]
+    tr_graphs = tr_pos_graphs + tr_neg_graphs
+    te_graphs = te_pos_graphs + te_neg_graphs
+    tr_targets = [1] * len(tr_pos_graphs) + [0] * len(tr_neg_graphs)
+    te_targets = [1] * len(te_pos_graphs) + [0] * len(te_neg_graphs)
+    tr_graphs, tr_targets = paired_shuffle(tr_graphs, tr_targets)
+    te_graphs, te_targets = paired_shuffle(te_graphs, te_targets)
+    return (tr_graphs, np.array(tr_targets)), (te_graphs, np.array(te_targets))
 
 
 @timeit
@@ -243,7 +152,7 @@ def output_avg_and_std(iterable):
 
 
 @timeit
-def perf(te_graphs, y_true, y_pred, y_score):
+def perf(y_true, y_pred, y_score):
     """perf."""
     print 'Accuracy: %.2f' % accuracy_score(y_true, y_pred)
     print ' AUC ROC: %.2f' % roc_auc_score(y_true, y_score)

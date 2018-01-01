@@ -39,19 +39,44 @@ def serialize_graph(graph):
     return serial_data
 
 
+def map_labels_to_colors(graphs):
+    """Map all node labels into a real in [0,1]."""
+    label_set = set()
+    for g in graphs:
+        for u in g.nodes():
+            label_set.add(g.node[u]['label'])
+    dim = len(label_set)
+    label_colors = dict()
+    for i, label in enumerate(sorted(label_set)):
+        label_colors[label] = float(i) / dim
+    return label_colors
+
+
 def draw_graph(graph,
                vertex_label='label',
                secondary_vertex_label=None,
                edge_label='label',
                secondary_edge_label=None,
                vertex_color=None,
+               vertex_color_dict=None,
                vertex_alpha=0.6,
                vertex_border=1,
                vertex_size=600,
+               colormap='YlOrRd',
+               vmin=0,
+               vmax=1,
+               invert_colormap=False,
 
+               edge_colormap='YlOrRd',
+               edge_vmin=0,
+               edge_vmax=1,
                edge_color=None,
+               edge_width=None,
                edge_alpha=0.5,
 
+               dark_edge_colormap='YlOrRd',
+               dark_edge_vmin=0,
+               dark_edge_vmax=1,
                dark_edge_color=None,
                dark_edge_dotted=True,
                dark_edge_alpha=0.3,
@@ -63,10 +88,6 @@ def draw_graph(graph,
                prog='neato',
                pos=None,
 
-               colormap='YlOrRd',
-               vmin=0,
-               vmax=1,
-               invert_colormap=False,
                verbose=True,
                file_name=None,
                title_key='id',
@@ -115,10 +136,10 @@ def draw_graph(graph,
         node_color = []
         for u, d in graph.nodes(data=True):
             label = d.get('label', '.')
-            node_color.append(hash(_serialize_list(label)))
-        color_set = set(node_color)
-        color_map = {c: i for i, c in enumerate(color_set)}
-        node_color = [color_map[c] for c in node_color]
+            if vertex_color_dict is not None:
+                node_color.append(vertex_color_dict.get(label, 0))
+            else:
+                node_color.append(hash(_serialize_list(label)))
     else:
         if invert_colormap:
             node_color = [- d.get(vertex_color, 0)
@@ -131,7 +152,14 @@ def draw_graph(graph,
             node_color = [math.log(c) if c > log_threshold
                           else math.log(log_threshold)
                           for c in node_color]
-
+    if edge_width is None:
+        widths = 1
+    elif isinstance(edge_width, int):
+        widths = edge_width
+    else:
+        widths = [d.get(edge_width, 1)
+                  for u, v, d in graph.edges(data=True)
+                  if 'nesting' not in d]
     if edge_color is None:
         edge_colors = 'black'
     elif edge_color in ['_labels_', '_label_', '__labels__', '__label__']:
@@ -168,7 +196,7 @@ def draw_graph(graph,
                 graph_copy.edge[u][v] = {}
             pos = nx.graphviz_layout(graph_copy,
                                      prog=prog,
-                                     args="-Gmode=KK")
+                                     args="-Gmaxiter=1000")
         elif layout == "RNA":
             import RNA
             rna_object = RNA.get_xy_coordinates(graph.graph['structure'])
@@ -201,14 +229,16 @@ def draw_graph(graph,
                                    alpha=vertex_alpha,
                                    node_size=vertex_size,
                                    linewidths=linewidths,
-                                   cmap=plt.get_cmap(colormap))
+                                   cmap=plt.get_cmap(colormap),
+                                   vmin=vmin, vmax=vmax)
     nodes.set_edgecolor('k')
 
     nx.draw_networkx_edges(graph, pos,
                            edgelist=edges_normal,
-                           width=2,
+                           width=widths,
                            edge_color=edge_colors,
-                           cmap=plt.get_cmap(colormap),
+                           edge_cmap=plt.get_cmap(edge_colormap),
+                           edge_vmin=edge_vmin, edge_vmax=edge_vmax,
                            alpha=edge_alpha)
     if dark_edge_dotted:
         style = 'dotted'
@@ -217,6 +247,8 @@ def draw_graph(graph,
     nx.draw_networkx_edges(graph, pos,
                            edgelist=edges_nesting,
                            width=1,
+                           edge_cmap=plt.get_cmap(dark_edge_colormap),
+                           edge_vmin=dark_edge_vmin, edge_vmax=dark_edge_vmax,
                            edge_color=dark_edge_colors,
                            style=style,
                            alpha=dark_edge_alpha)
@@ -348,20 +380,15 @@ def dendrogram(data,
 
     "median","centroid","weighted","single","ward","complete","average"
     """
-    if hasattr(data, '__iter__'):
-        iterable = data
-    else:
-        raise Exception('ERROR: Input must be iterable')
-    import itertools
-    iterable_1, iterable_2 = itertools.tee(iterable)
+    data = list(data)
     # get labels
     labels = []
-    for graph in iterable_2:
+    for graph in data:
         label = graph.graph.get('id', None)
         if label:
             labels.append(label)
     # transform input into sparse vectors
-    data_matrix = vectorizer.transform(iterable_1)
+    data_matrix = vectorizer.transform(data)
 
     # labels
     if not labels:
@@ -416,11 +443,11 @@ def plot_embedding(data_matrix, y,
         ax = plt.subplot(111)
         for i in range(num_instances):
             img = Image.open(image_file_name + str(i) + '.png')
-            imagebox = \
-                offsetbox.AnnotationBbox(offsetbox.OffsetImage(img, zoom=1),
-                                         data_matrix[i],
-                                         pad=0,
-                                         frameon=False)
+            imagebox = offsetbox.AnnotationBbox(
+                offsetbox.OffsetImage(img, zoom=1),
+                data_matrix[i],
+                pad=0,
+                frameon=False)
             ax.add_artist(imagebox)
     if labels is not None:
         for id in range(data_matrix.shape[0]):
